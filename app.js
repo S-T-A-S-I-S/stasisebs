@@ -1,6 +1,6 @@
 // app.js — Cloudflare Worker + KV live sync (OBS/vMix safe)
 // Control panel writes via HTTPS POST, Overlay polls via HTTPS GET.
-// Works on locked-down school networks (no websockets, no local server).
+// Fixes "buggy typing" by NOT rebuilding the control UI repeatedly.
 
 const API = "https://stasisebs.2024mmorgan.workers.dev/state?key=playerOverlay";
 const OVERLAY_KEY = ""; // OPTIONAL: set to your secret if you add env var OVERLAY_KEY in Cloudflare Worker
@@ -126,19 +126,19 @@ function apiPostDebounced(state) {
   }, 120);
 }
 
-function escapeHtml(s) {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
+// -------------------- Overlay Rendering --------------------
+async function waitForFonts() {
+  try {
+    if (document.fonts && document.fonts.status !== "loaded") {
+      await document.fonts.ready;
+    }
+  } catch (_) {}
 }
 
-// -------------------- Overlay Rendering --------------------
 function fitTextToWidth(el, maxPx) {
   let size = parseFloat(getComputedStyle(el).fontSize) || 34;
 
-  const MIN = 16; // allow tighter fit for long names
+  const MIN = 16;
   const MAX = 36;
 
   size = Math.min(MAX, size);
@@ -150,7 +150,6 @@ function fitTextToWidth(el, maxPx) {
     el.style.fontSize = size + "px";
   }
 
-  // If still overflowing, hard clamp with ellipsis as a last resort
   if (el.scrollWidth > maxPx) {
     el.style.whiteSpace = "nowrap";
     el.style.overflow = "hidden";
@@ -165,9 +164,7 @@ function renderOverlay(state) {
   if (!bg || !slots) return;
 
   const mode = clamp(state.mode, 1, 6);
-
-  // Your templates: 11.png..16.png
-  bg.src = `${10 + mode}.png`;
+  bg.src = `${10 + mode}.png`; // 11..16
 
   slots.innerHTML = "";
   const boxes = BOXES[mode];
@@ -187,29 +184,30 @@ function renderOverlay(state) {
     line.className = "tagline";
     line.textContent = text;
 
+    // Force Edo on dynamic nodes (prevents fallback during rerender)
+    line.style.fontFamily = "Edo, edo, 'Edo', sans-serif";
+
     slot.appendChild(line);
     slots.appendChild(slot);
 
-    // match your padding/logo clearance assumptions
     const maxTextWidth = b.w - 26 - 78;
     fitTextToWidth(line, maxTextWidth);
   });
 }
 
-// -------------------- Control Panel UI --------------------
-function renderControl(state) {
+// -------------------- Control Panel (Non-buggy) --------------------
+let controlState = structuredClone(defaults);
+let lastModeBuilt = null;
+
+function buildControlUIForMode(mode) {
   const modeSel = document.getElementById("mode");
   const playersWrap = document.getElementById("players");
   if (!modeSel || !playersWrap) return;
 
-  modeSel.value = String(state.mode);
-  const mode = clamp(state.mode, 1, 6);
-
+  modeSel.value = String(mode);
   playersWrap.innerHTML = "";
 
   for (let i = 0; i < mode; i++) {
-    const p = state.players[i] || { name: "PLAYER NAME", user: "USERNAME" };
-
     const card = document.createElement("div");
     card.className = "playerCard";
 
@@ -219,105 +217,158 @@ function renderControl(state) {
 
     const nameLab = document.createElement("label");
     nameLab.innerHTML = `Player Name
-      <input type="text" value="${escapeHtml(p.name)}" data-i="${i}" data-k="name" autocomplete="off">`;
+      <input id="p${i}-name" type="text" autocomplete="off">`;
     card.appendChild(nameLab);
 
     const userLab = document.createElement("label");
     userLab.innerHTML = `Username
-      <input type="text" value="${escapeHtml(p.user)}" data-i="${i}" data-k="user" autocomplete="off">`;
+      <input id="p${i}-user" type="text" autocomplete="off">`;
     card.appendChild(userLab);
 
     playersWrap.appendChild(card);
   }
 
-  // input -> push to KV
-  playersWrap.querySelectorAll("input").forEach((inp) => {
-    inp.addEventListener("input", () => {
-      const i = Number(inp.dataset.i);
-      const k = inp.dataset.k;
-
-      const next = normalizeState(state);
-      next.players[i][k] = inp.value;
-
-      apiPostDebounced(next);
-    });
-  });
-
-  // mode change -> push to KV
+  // Mode selector handler (write to KV)
   modeSel.onchange = () => {
-    const next = normalizeState(state);
+    const next = normalizeState(controlState);
     next.mode = clamp(Number(modeSel.value), 1, 6);
+    controlState = next;
     apiPostDebounced(next);
   };
 
-  // buttons
+  // Input handlers (write to KV)
+  for (let i = 0; i < mode; i++) {
+    const nameInp = document.getElementById(`p${i}-name`);
+    const userInp = document.getElementById(`p${i}-user`);
+
+    nameInp.addEventListener("input", () => {
+      const next = normalizeState(controlState);
+      next.players[i].name = nameInp.value;
+      controlState = next;
+      apiPostDebounced(next);
+    });
+
+    userInp.addEventListener("input", () => {
+      const next = normalizeState(controlState);
+      next.players[i].user = userInp.value;
+      controlState = next;
+      apiPostDebounced(next);
+    });
+  }
+
+  // Buttons
   const demoBtn = document.getElementById("fillDemo");
   const resetBtn = document.getElementById("reset");
 
   if (demoBtn) {
     demoBtn.onclick = () => {
-      const next = normalizeState(state);
+      const next = normalizeState(controlState);
       next.players = next.players.map((_, idx) => ({
         name: ["MONTANA", "ALEX", "JORDAN", "RILEY", "CASEY", "SKY"][idx] || `PLAYER ${idx + 1}`,
         user: ["ITZDIRT", "ACE", "J0RD", "R1LEY", "C4SEY", "SKYNET"][idx] || `USER${idx + 1}`,
       }));
+      controlState = next;
       apiPostDebounced(next);
+      applyStateToControlInputs(next);
     };
   }
 
   if (resetBtn) {
-    resetBtn.onclick = () => apiPostDebounced(structuredClone(defaults));
+    resetBtn.onclick = () => {
+      const next = structuredClone(defaults);
+      controlState = next;
+      apiPostDebounced(next);
+      applyStateToControlInputs(next);
+    };
   }
 }
 
-// -------------------- Boot + Live Loops --------------------
-const isControl = document.body.classList.contains("control");
-const isOverlay = document.body.classList.contains("overlay");
+function applyStateToControlInputs(state) {
+  const mode = clamp(state.mode, 1, 6);
 
-let lastJson = "";
+  // Update the mode dropdown (unless user is actively changing it)
+  const modeSel = document.getElementById("mode");
+  if (modeSel && document.activeElement !== modeSel) {
+    modeSel.value = String(mode);
+  }
+
+  for (let i = 0; i < mode; i++) {
+    const nameInp = document.getElementById(`p${i}-name`);
+    const userInp = document.getElementById(`p${i}-user`);
+    if (!nameInp || !userInp) continue;
+
+    // Don't overwrite what the user is actively typing
+    if (document.activeElement !== nameInp) {
+      const v = state.players[i]?.name ?? "";
+      if (nameInp.value !== v) nameInp.value = v;
+    }
+
+    if (document.activeElement !== userInp) {
+      const v = state.players[i]?.user ?? "";
+      if (userInp.value !== v) userInp.value = v;
+    }
+  }
+}
+
+// -------------------- Live Loops --------------------
+let lastOverlayJson = "";
 
 async function overlayLoop() {
   try {
     const state = await apiGet();
     const json = JSON.stringify(state);
 
-    // only re-render if something changed
-    if (json !== lastJson) {
-      lastJson = json;
+    if (json !== lastOverlayJson) {
+      lastOverlayJson = json;
+      await waitForFonts();
       renderOverlay(state);
     }
   } catch (e) {
     console.warn("Overlay GET error:", e);
   } finally {
-    // 250ms poll = "live enough" and very school-network friendly
     setTimeout(overlayLoop, 250);
   }
 }
 
 async function controlSyncLoop() {
   try {
-    const state = await apiGet();
-    // keep UI synced if another machine edits
-    renderControl(state);
+    const remote = await apiGet();
+    controlState = remote;
+
+    const mode = clamp(remote.mode, 1, 6);
+
+    // Only rebuild the UI when the mode changes
+    if (lastModeBuilt !== mode) {
+      lastModeBuilt = mode;
+      buildControlUIForMode(mode);
+    }
+
+    // Otherwise only apply values safely
+    applyStateToControlInputs(remote);
   } catch (e) {
     console.warn("Control sync GET error:", e);
   } finally {
-    setTimeout(controlSyncLoop, 1000);
+    setTimeout(controlSyncLoop, 500);
   }
 }
 
+// -------------------- Boot --------------------
+const isControl = document.body.classList.contains("control");
+const isOverlay = document.body.classList.contains("overlay");
+
 (async () => {
-  // initial load
   const initial = await apiGet().catch(() => structuredClone(defaults));
-  lastJson = JSON.stringify(initial);
 
   if (isOverlay) {
+    lastOverlayJson = JSON.stringify(initial);
+    await waitForFonts();
     renderOverlay(initial);
     overlayLoop();
   }
 
   if (isControl) {
-    renderControl(initial);
+    controlState = initial;
+    lastModeBuilt = null; // force first build
     controlSyncLoop();
   }
 })();
