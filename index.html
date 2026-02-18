@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>STASIS vMix Overlays</title>
+  <style>
+    :root{--gold:#FDB827;--bg:#0b0b0f;--panel:rgba(255,255,255,.06);--border:rgba(253,184,39,.25);--text:#fff}
+    *{box-sizing:border-box}
+    body{margin:0;background:radial-gradient(circle at 20% 20%, #111117, #07070b);font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;color:var(--text)}
+    .wrap{max-width:1000px;margin:0 auto;padding:60px 24px}
+    h1{margin:0 0 10px;color:var(--gold);letter-spacing:2px}
+    p{margin:0 0 26px;opacity:.8;line-height:1.5}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px}
+    .card{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:18px}
+    .card h2{margin:0 0 10px;color:var(--gold)}
+    .btn{display:inline-block;margin-top:10px;padding:10px 14px;border-radius:12px;
+      border:1px solid rgba(253,184,39,.5);background:rgba(253,184,39,.16);color:#fff;text-decoration:none;font-weight:800}
+    .btn:hover{background:rgba(253,184,39,.24)}
+    .small{opacity:.6;margin-top:30px;font-size:13px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>STASIS Broadcast Overlays</h1>
+    <p>GitHub-hosted vMix Browser Sources with a live control panel (no local server).</p>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Overlay</h2>
+        <p>Load this in vMix Web Browser input.</p>
+        <a class="btn" href="overlay.html" target="_blank">Open overlay.html</a>
+      </div>
+
+      <div class="card">
+        <h2>Control Panel</h2>
+        <p>Open this in Chrome to pick 1–6 players and edit names live.</p>
+        <a class="btn" href="control.html" target="_blank">Open control.html</a>
+      </div>
+    </div>
+
+    <div class="small">Tip: In vMix, set the Web input to 1920×1080 for pixel-perfect alignment.</div>
+  </div>
+</body>
+</html>

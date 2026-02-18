@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Player Overlay Control</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body class="control">
+  <div class="panel">
+    <h1>Player Overlay Control</h1>
+
+    <label class="row">
+      Mode
+      <select id="mode">
+        <option value="1">1v1 (1 player)</option>
+        <option value="2">2v2 (2 players)</option>
+        <option value="3">3v3 (3 players)</option>
+        <option value="4">4v4 (4 players)</option>
+        <option value="5" selected>5v5 (5 players)</option>
+        <option value="6">6v6 (6 players)</option>
+      </select>
+    </label>
+
+    <div id="players" class="players"></div>
+
+    <div class="buttons">
+      <button id="fillDemo">Fill Demo</button>
+      <button id="reset">Reset</button>
+    </div>
+
+    <p class="hint">
+      Keep this tab open. vMix loads <b>overlay.html</b>. Changes push live.
+    </p>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
