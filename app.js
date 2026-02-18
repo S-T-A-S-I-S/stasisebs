@@ -1,98 +1,179 @@
-const KEY = "stasis_player_overlay_v1";
-const CHANNEL = "stasis_player_overlay_channel";
+// app.js — Cloudflare Worker + KV live sync (OBS/vMix safe)
+// Control panel writes via HTTPS POST, Overlay polls via HTTPS GET.
+// Works on locked-down school networks (no websockets, no local server).
 
+const API = "https://stasisebs.2024mmorgan.workers.dev/state?key=playerOverlay";
+const OVERLAY_KEY = ""; // OPTIONAL: set to your secret if you add env var OVERLAY_KEY in Cloudflare Worker
+
+// -------------------- Defaults --------------------
 const defaults = {
   mode: 5,
   players: Array.from({ length: 6 }, () => ({
     name: "PLAYER NAME",
-    user: "USERNAME"
-  }))
+    user: "USERNAME",
+  })),
 };
 
-/**
- * Box coordinates detected from your PNGs:
- * 11.png => 1 box
- * 12.png => 2 boxes
- * ...
- * 16.png => 6 boxes
- *
- * Coordinates are {x,y,w,h} in 1920x1080 space.
- */
+// Coordinates in 1920x1080 space
 const BOXES = {
   1: [{ x: 615, y: 281, w: 690, h: 518 }],
-  2: [{ x: 185, y: 281, w: 691, h: 518 }, { x: 1036, y: 281, w: 691, h: 518 }],
-  3: [{ x: 146, y: 378, w: 433, h: 324 }, { x: 744, y: 378, w: 433, h: 324 }, { x: 1341, y: 378, w: 433, h: 324 }],
-  4: [{ x: 304, y: 159, w: 491, h: 368 }, { x: 1124, y: 159, w: 492, h: 368 }, { x: 304, y: 553, w: 491, h: 368 }, { x: 1124, y: 553, w: 492, h: 368 }],
-  5: [{ x: 146, y: 159, w: 433, h: 324 }, { x: 744, y: 159, w: 433, h: 324 }, { x: 1341, y: 159, w: 433, h: 324 }, { x: 362, y: 601, w: 433, h: 324 }, { x: 1124, y: 601, w: 433, h: 324 }],
-  6: [{ x: 146, y: 159, w: 433, h: 324 }, { x: 744, y: 159, w: 433, h: 324 }, { x: 1341, y: 159, w: 433, h: 324 }, { x: 146, y: 601, w: 433, h: 324 }, { x: 744, y: 601, w: 433, h: 324 }, { x: 1341, y: 601, w: 433, h: 324 }]
+  2: [
+    { x: 185, y: 281, w: 691, h: 518 },
+    { x: 1036, y: 281, w: 691, h: 518 },
+  ],
+  3: [
+    { x: 146, y: 378, w: 433, h: 324 },
+    { x: 744, y: 378, w: 433, h: 324 },
+    { x: 1341, y: 378, w: 433, h: 324 },
+  ],
+  4: [
+    { x: 304, y: 159, w: 491, h: 368 },
+    { x: 1124, y: 159, w: 492, h: 368 },
+    { x: 304, y: 553, w: 491, h: 368 },
+    { x: 1124, y: 553, w: 492, h: 368 },
+  ],
+  5: [
+    { x: 146, y: 159, w: 433, h: 324 },
+    { x: 744, y: 159, w: 433, h: 324 },
+    { x: 1341, y: 159, w: 433, h: 324 },
+    { x: 362, y: 601, w: 433, h: 324 },
+    { x: 1124, y: 601, w: 433, h: 324 },
+  ],
+  6: [
+    { x: 146, y: 159, w: 433, h: 324 },
+    { x: 744, y: 159, w: 433, h: 324 },
+    { x: 1341, y: 159, w: 433, h: 324 },
+    { x: 146, y: 601, w: 433, h: 324 },
+    { x: 744, y: 601, w: 433, h: 324 },
+    { x: 1341, y: 601, w: 433, h: 324 },
+  ],
 };
 
-function loadState(){
-  try{
-    const raw = localStorage.getItem(KEY);
-    if(!raw) return structuredClone(defaults);
-    const parsed = JSON.parse(raw);
-    // merge safely
-    const s = structuredClone(defaults);
-    if(parsed && typeof parsed.mode === "number") s.mode = clamp(parsed.mode, 1, 6);
-    if(Array.isArray(parsed.players)){
-      for(let i=0;i<6;i++){
-        if(parsed.players[i]){
-          s.players[i].name = String(parsed.players[i].name ?? s.players[i].name);
-          s.players[i].user = String(parsed.players[i].user ?? s.players[i].user);
+// -------------------- Helpers --------------------
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function normalizeState(s) {
+  const out = structuredClone(defaults);
+
+  if (s && typeof s === "object") {
+    if (typeof s.mode === "number") out.mode = clamp(s.mode, 1, 6);
+
+    if (Array.isArray(s.players)) {
+      for (let i = 0; i < 6; i++) {
+        if (s.players[i]) {
+          out.players[i].name = String(
+            s.players[i].name ?? out.players[i].name
+          );
+          out.players[i].user = String(
+            s.players[i].user ?? out.players[i].user
+          );
         }
       }
     }
-    return s;
-  }catch{
+  }
+
+  return out;
+}
+
+function headersWithKey(extra = {}) {
+  return {
+    ...extra,
+    ...(OVERLAY_KEY ? { "X-Overlay-Key": OVERLAY_KEY } : {}),
+  };
+}
+
+async function apiGet() {
+  const r = await fetch(API, {
+    method: "GET",
+    headers: headersWithKey(),
+    cache: "no-store",
+  });
+
+  if (!r.ok) throw new Error(`GET failed: ${r.status}`);
+
+  const txt = await r.text();
+  try {
+    return normalizeState(JSON.parse(txt || "{}"));
+  } catch {
     return structuredClone(defaults);
   }
 }
 
-function saveState(state){
-  localStorage.setItem(KEY, JSON.stringify(state));
+// Debounced POST to avoid spamming on every keystroke
+let postTimer = null;
+let latestToPost = null;
+
+function apiPostDebounced(state) {
+  latestToPost = state;
+  if (postTimer) return;
+
+  postTimer = setTimeout(async () => {
+    const payload = latestToPost;
+    latestToPost = null;
+    postTimer = null;
+
+    try {
+      await fetch(API, {
+        method: "POST",
+        headers: headersWithKey({ "Content-Type": "application/json" }),
+        body: JSON.stringify(payload),
+      });
+    } catch (e) {
+      console.warn("POST error:", e);
+    }
+  }, 120);
 }
 
-function clamp(n,min,max){ return Math.max(min, Math.min(max, n)); }
-
-let bc = null;
-try { bc = new BroadcastChannel(CHANNEL); } catch { bc = null; }
-function broadcast(state){
-  if(bc) bc.postMessage({ type:"STATE", state });
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 }
 
-// ---------- Overlay rendering ----------
-function fitTextToWidth(el, maxPx){
-  // Start from CSS size and shrink until fits
+// -------------------- Overlay Rendering --------------------
+function fitTextToWidth(el, maxPx) {
   let size = parseFloat(getComputedStyle(el).fontSize) || 34;
-  el.style.fontSize = size + "px";
 
-  // hard limits (keeps it readable)
-  const MIN = 18;
+  const MIN = 16; // allow tighter fit for long names
   const MAX = 36;
 
   size = Math.min(MAX, size);
+  el.style.fontSize = size + "px";
 
-  for(let i=0;i<40;i++){
-    if(el.scrollWidth <= maxPx || size <= MIN) break;
+  for (let i = 0; i < 60; i++) {
+    if (el.scrollWidth <= maxPx || size <= MIN) break;
     size -= 1;
     el.style.fontSize = size + "px";
   }
+
+  // If still overflowing, hard clamp with ellipsis as a last resort
+  if (el.scrollWidth > maxPx) {
+    el.style.whiteSpace = "nowrap";
+    el.style.overflow = "hidden";
+    el.style.textOverflow = "ellipsis";
+    el.style.maxWidth = maxPx + "px";
+  }
 }
 
-function renderOverlay(state){
+function renderOverlay(state) {
   const bg = document.getElementById("bg");
   const slots = document.getElementById("slots");
-  if(!bg || !slots) return;
+  if (!bg || !slots) return;
 
   const mode = clamp(state.mode, 1, 6);
-  bg.src = `${10 + mode}.png`; // 11.png..16.png
+
+  // Your templates: 11.png..16.png
+  bg.src = `${10 + mode}.png`;
 
   slots.innerHTML = "";
   const boxes = BOXES[mode];
 
   boxes.forEach((b, idx) => {
-    const p = state.players[idx] || { name:"PLAYER NAME", user:"USERNAME" };
+    const p = state.players[idx] || { name: "PLAYER NAME", user: "USERNAME" };
     const text = `${p.name} | ${p.user}`;
 
     const slot = document.createElement("div");
@@ -109,122 +190,134 @@ function renderOverlay(state){
     slot.appendChild(line);
     slots.appendChild(slot);
 
-    // Fit inside the sliver (account for padding + tiger logo)
-    const maxTextWidth = b.w - 26 - 78; // left+right padding from CSS
+    // match your padding/logo clearance assumptions
+    const maxTextWidth = b.w - 26 - 78;
     fitTextToWidth(line, maxTextWidth);
   });
 }
 
-// ---------- Control panel rendering ----------
-function renderControl(state){
+// -------------------- Control Panel UI --------------------
+function renderControl(state) {
   const modeSel = document.getElementById("mode");
   const playersWrap = document.getElementById("players");
-  if(!modeSel || !playersWrap) return;
+  if (!modeSel || !playersWrap) return;
 
   modeSel.value = String(state.mode);
-
   const mode = clamp(state.mode, 1, 6);
+
   playersWrap.innerHTML = "";
 
-  for(let i=0;i<mode;i++){
-    const p = state.players[i] || { name:"PLAYER NAME", user:"USERNAME" };
+  for (let i = 0; i < mode; i++) {
+    const p = state.players[i] || { name: "PLAYER NAME", user: "USERNAME" };
 
     const card = document.createElement("div");
     card.className = "playerCard";
 
     const h = document.createElement("h3");
-    h.textContent = `PLAYER ${i+1}`;
+    h.textContent = `PLAYER ${i + 1}`;
     card.appendChild(h);
 
     const nameLab = document.createElement("label");
-    nameLab.innerHTML = `Player Name<input type="text" value="${escapeHtml(p.name)}" data-i="${i}" data-k="name">`;
+    nameLab.innerHTML = `Player Name
+      <input type="text" value="${escapeHtml(p.name)}" data-i="${i}" data-k="name" autocomplete="off">`;
     card.appendChild(nameLab);
 
     const userLab = document.createElement("label");
-    userLab.innerHTML = `Username<input type="text" value="${escapeHtml(p.user)}" data-i="${i}" data-k="user">`;
+    userLab.innerHTML = `Username
+      <input type="text" value="${escapeHtml(p.user)}" data-i="${i}" data-k="user" autocomplete="off">`;
     card.appendChild(userLab);
 
     playersWrap.appendChild(card);
   }
 
-  playersWrap.querySelectorAll("input").forEach(inp => {
+  // input -> push to KV
+  playersWrap.querySelectorAll("input").forEach((inp) => {
     inp.addEventListener("input", () => {
       const i = Number(inp.dataset.i);
       const k = inp.dataset.k;
-      const next = loadState();
-      next.mode = mode;
+
+      const next = normalizeState(state);
       next.players[i][k] = inp.value;
-      saveState(next);
-      broadcast(next);
+
+      apiPostDebounced(next);
     });
   });
 
+  // mode change -> push to KV
   modeSel.onchange = () => {
-    const next = loadState();
+    const next = normalizeState(state);
     next.mode = clamp(Number(modeSel.value), 1, 6);
-    saveState(next);
-    broadcast(next);
-    renderControl(next);
+    apiPostDebounced(next);
   };
 
+  // buttons
   const demoBtn = document.getElementById("fillDemo");
   const resetBtn = document.getElementById("reset");
 
-  if(demoBtn){
+  if (demoBtn) {
     demoBtn.onclick = () => {
-      const next = loadState();
-      next.players = next.players.map((p, idx) => ({
-        name: ["MONTANA","ALEX","JORDAN","RILEY","CASEY","SKY"][idx] || `PLAYER ${idx+1}`,
-        user: ["ITZDIRT","ACE","J0RD","R1LEY","C4SEY","SKYNET"][idx] || `USER${idx+1}`
+      const next = normalizeState(state);
+      next.players = next.players.map((_, idx) => ({
+        name: ["MONTANA", "ALEX", "JORDAN", "RILEY", "CASEY", "SKY"][idx] || `PLAYER ${idx + 1}`,
+        user: ["ITZDIRT", "ACE", "J0RD", "R1LEY", "C4SEY", "SKYNET"][idx] || `USER${idx + 1}`,
       }));
-      saveState(next);
-      broadcast(next);
-      renderControl(next);
+      apiPostDebounced(next);
     };
   }
 
-  if(resetBtn){
-    resetBtn.onclick = () => {
-      saveState(structuredClone(defaults));
-      broadcast(structuredClone(defaults));
-      renderControl(structuredClone(defaults));
-    };
+  if (resetBtn) {
+    resetBtn.onclick = () => apiPostDebounced(structuredClone(defaults));
   }
 }
 
-function escapeHtml(s){
-  return String(s)
-    .replaceAll("&","&amp;")
-    .replaceAll("<","&lt;")
-    .replaceAll(">","&gt;")
-    .replaceAll('"',"&quot;");
-}
-
-// ---------- Boot ----------
+// -------------------- Boot + Live Loops --------------------
 const isControl = document.body.classList.contains("control");
-let state = loadState();
+const isOverlay = document.body.classList.contains("overlay");
 
-if(isControl){
-  renderControl(state);
-} else {
-  renderOverlay(state);
+let lastJson = "";
 
-  if(bc){
-    bc.onmessage = (ev) => {
-      if(ev?.data?.type === "STATE" && ev.data.state){
-        state = ev.data.state;
-        saveState(state);
-        renderOverlay(state);
-      }
-    };
-  }
+async function overlayLoop() {
+  try {
+    const state = await apiGet();
+    const json = JSON.stringify(state);
 
-  // Fallback polling (still no server)
-  setInterval(() => {
-    const next = loadState();
-    if(JSON.stringify(next) !== JSON.stringify(state)){
-      state = next;
+    // only re-render if something changed
+    if (json !== lastJson) {
+      lastJson = json;
       renderOverlay(state);
     }
-  }, 250);
+  } catch (e) {
+    console.warn("Overlay GET error:", e);
+  } finally {
+    // 250ms poll = "live enough" and very school-network friendly
+    setTimeout(overlayLoop, 250);
+  }
 }
+
+async function controlSyncLoop() {
+  try {
+    const state = await apiGet();
+    // keep UI synced if another machine edits
+    renderControl(state);
+  } catch (e) {
+    console.warn("Control sync GET error:", e);
+  } finally {
+    setTimeout(controlSyncLoop, 1000);
+  }
+}
+
+(async () => {
+  // initial load
+  const initial = await apiGet().catch(() => structuredClone(defaults));
+  lastJson = JSON.stringify(initial);
+
+  if (isOverlay) {
+    renderOverlay(initial);
+    overlayLoop();
+  }
+
+  if (isControl) {
+    renderControl(initial);
+    controlSyncLoop();
+  }
+})();
