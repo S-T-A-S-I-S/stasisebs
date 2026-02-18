@@ -1,6 +1,6 @@
-// app.js — Cloudflare Worker + KV live sync (OBS/vMix safe)
-// CONTROL: no polling, no timed re-renders (prevents cursor being kicked).
-// OVERLAY: polls KV every 250ms and updates in OBS/vMix.
+// app.js — "Edit locally, SEND button to push" (OBS/vMix safe)
+// Control: no autosync, no live posting; only SEND triggers POST.
+// Overlay: polls KV every 250ms and updates when state changes.
 
 const API = "https://stasisebs.2024mmorgan.workers.dev/state?key=playerOverlay";
 const OVERLAY_KEY = ""; // OPTIONAL: if you set OVERLAY_KEY in Cloudflare Worker, set it here too.
@@ -97,29 +97,15 @@ async function apiGet() {
   }
 }
 
-// Debounced POST to avoid spamming on every keystroke
-let postTimer = null;
-let latestToPost = null;
-
-function apiPostDebounced(state) {
-  latestToPost = state;
-  if (postTimer) return;
-
-  postTimer = setTimeout(async () => {
-    const payload = latestToPost;
-    latestToPost = null;
-    postTimer = null;
-
-    try {
-      await fetch(API, {
-        method: "POST",
-        headers: headersWithKey({ "Content-Type": "application/json" }),
-        body: JSON.stringify(payload),
-      });
-    } catch (e) {
-      console.warn("POST error:", e);
-    }
-  }, 120);
+async function apiPost(state) {
+  const payload = normalizeState(state);
+  const r = await fetch(API, {
+    method: "POST",
+    headers: headersWithKey({ "Content-Type": "application/json" }),
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) throw new Error(`POST failed: ${r.status}`);
+  return true;
 }
 
 // -------------------- Overlay Rendering --------------------
@@ -188,8 +174,8 @@ function renderOverlay(state) {
   });
 }
 
-// -------------------- Control Rendering (NO timers) --------------------
-let controlState = structuredClone(defaults);
+// -------------------- Control UI (local draft) --------------------
+let draft = structuredClone(defaults);
 
 function buildControlUI(mode) {
   const modeSel = document.getElementById("mode");
@@ -220,80 +206,46 @@ function buildControlUI(mode) {
     playersWrap.appendChild(card);
   }
 
-  // Fill values
+  // Fill from draft
   for (let i = 0; i < mode; i++) {
     const nameInp = document.getElementById(`p${i}-name`);
     const userInp = document.getElementById(`p${i}-user`);
-    nameInp.value = controlState.players[i]?.name ?? "";
-    userInp.value = controlState.players[i]?.user ?? "";
+    nameInp.value = draft.players[i]?.name ?? "";
+    userInp.value = draft.players[i]?.user ?? "";
   }
 
-  // Mode change: rebuild + POST
+  // Update draft as you type (no POST)
   modeSel.onchange = () => {
-    const next = normalizeState(controlState);
-    next.mode = clamp(Number(modeSel.value), 1, 6);
-    controlState = next;
-    buildControlUI(next.mode);     // rebuild ONLY on your explicit mode change
-    apiPostDebounced(next);
+    draft.mode = clamp(Number(modeSel.value), 1, 6);
+    buildControlUI(draft.mode); // rebuild only when you change mode
   };
 
-  // Inputs: update state + POST (no rebuild)
   for (let i = 0; i < mode; i++) {
     const nameInp = document.getElementById(`p${i}-name`);
     const userInp = document.getElementById(`p${i}-user`);
 
     nameInp.addEventListener("input", () => {
-      const next = normalizeState(controlState);
-      next.players[i].name = nameInp.value;
-      controlState = next;
-      apiPostDebounced(next);
+      draft.players[i].name = nameInp.value;
     });
 
     userInp.addEventListener("input", () => {
-      const next = normalizeState(controlState);
-      next.players[i].user = userInp.value;
-      controlState = next;
-      apiPostDebounced(next);
+      draft.players[i].user = userInp.value;
     });
-  }
-
-  // Buttons
-  const demoBtn = document.getElementById("fillDemo");
-  const resetBtn = document.getElementById("reset");
-
-  if (demoBtn) {
-    demoBtn.onclick = () => {
-      const next = normalizeState(controlState);
-      next.players = next.players.map((_, idx) => ({
-        name: ["MONTANA", "ALEX", "JORDAN", "RILEY", "CASEY", "SKY"][idx] || `PLAYER ${idx + 1}`,
-        user: ["ITZDIRT", "ACE", "J0RD", "R1LEY", "C4SEY", "SKYNET"][idx] || `USER${idx + 1}`,
-      }));
-      controlState = next;
-
-      // Update inputs instantly (no rebuild needed)
-      const modeNow = clamp(next.mode, 1, 6);
-      for (let i = 0; i < modeNow; i++) {
-        const nameInp = document.getElementById(`p${i}-name`);
-        const userInp = document.getElementById(`p${i}-user`);
-        if (nameInp) nameInp.value = next.players[i].name;
-        if (userInp) userInp.value = next.players[i].user;
-      }
-
-      apiPostDebounced(next);
-    };
-  }
-
-  if (resetBtn) {
-    resetBtn.onclick = () => {
-      const next = structuredClone(defaults);
-      controlState = next;
-      buildControlUI(next.mode);
-      apiPostDebounced(next);
-    };
   }
 }
 
-// -------------------- Overlay Poll Loop --------------------
+function setStatus(text, ok = true) {
+  const btn = document.getElementById("sendBtn");
+  if (!btn) return;
+  btn.textContent = text;
+  btn.disabled = !ok;
+  setTimeout(() => {
+    btn.textContent = "SEND TO OVERLAY";
+    btn.disabled = false;
+  }, 900);
+}
+
+// -------------------- Overlay poll loop --------------------
 let lastOverlayJson = "";
 
 async function overlayLoop() {
@@ -328,10 +280,55 @@ const isOverlay = document.body.classList.contains("overlay");
   }
 
   if (isControl) {
-    controlState = initial;
-    buildControlUI(clamp(initial.mode, 1, 6));
+    // Start your draft from what's currently live
+    draft = normalizeState(initial);
+    buildControlUI(clamp(draft.mode, 1, 6));
 
-    // IMPORTANT: no control polling. No timers. No focus stealing.
-    // If you later want multi-operator sync, we can add a "SYNC" button instead of auto-sync.
+    const sendBtn = document.getElementById("sendBtn");
+    const syncBtn = document.getElementById("syncBtn");
+    const demoBtn = document.getElementById("fillDemo");
+    const resetBtn = document.getElementById("reset");
+
+    if (sendBtn) {
+      sendBtn.onclick = async () => {
+        try {
+          setStatus("SENDING...", false);
+          await apiPost(draft);
+          setStatus("SENT ✅", true);
+        } catch (e) {
+          console.warn(e);
+          setStatus("FAILED ❌", true);
+        }
+      };
+    }
+
+    if (syncBtn) {
+      syncBtn.onclick = async () => {
+        try {
+          const live = await apiGet();
+          draft = normalizeState(live);
+          buildControlUI(clamp(draft.mode, 1, 6));
+        } catch (e) {
+          console.warn(e);
+        }
+      };
+    }
+
+    if (demoBtn) {
+      demoBtn.onclick = () => {
+        draft.players = draft.players.map((_, idx) => ({
+          name: ["MONTANA", "ALEX", "JORDAN", "RILEY", "CASEY", "SKY"][idx] || `PLAYER ${idx + 1}`,
+          user: ["ITZDIRT", "ACE", "J0RD", "R1LEY", "C4SEY", "SKYNET"][idx] || `USER${idx + 1}`,
+        }));
+        buildControlUI(clamp(draft.mode, 1, 6));
+      };
+    }
+
+    if (resetBtn) {
+      resetBtn.onclick = () => {
+        draft = structuredClone(defaults);
+        buildControlUI(clamp(draft.mode, 1, 6));
+      };
+    }
   }
 })();
