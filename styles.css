@@ -1,6 +1,6 @@
 @font-face{
   font-family: "Edo";
-  src: url("fonts/Edo.ttf") format("truetype");
+  src: url("fonts/edo.ttf") format("truetype");
   font-display: swap;
 }
 
@@ -105,3 +105,4 @@ button{
 }
 button:hover{background: rgba(253,184,39,.24);}
 .hint{opacity:.75;margin-top:14px;line-height:1.4}
+
