@@ -1,9 +1,9 @@
 // app.js — Cloudflare Worker + KV live sync (OBS/vMix safe)
 // Control panel writes via HTTPS POST, Overlay polls via HTTPS GET.
-// Fixes "buggy typing" by NOT rebuilding the control UI repeatedly.
+// Fixes cursor being kicked out by NEVER syncing/rebuilding while the user is typing.
 
 const API = "https://stasisebs.2024mmorgan.workers.dev/state?key=playerOverlay";
-const OVERLAY_KEY = ""; // OPTIONAL: set to your secret if you add env var OVERLAY_KEY in Cloudflare Worker
+const OVERLAY_KEY = ""; // OPTIONAL: if you set OVERLAY_KEY in Cloudflare Worker, set it here too.
 
 // -------------------- Defaults --------------------
 const defaults = {
@@ -58,17 +58,15 @@ function normalizeState(s) {
   const out = structuredClone(defaults);
 
   if (s && typeof s === "object") {
-    if (typeof s.mode === "number") out.mode = clamp(s.mode, 1, 6);
+    // allow mode to be string or number
+    const m = Number(s.mode);
+    if (Number.isFinite(m)) out.mode = clamp(m, 1, 6);
 
     if (Array.isArray(s.players)) {
       for (let i = 0; i < 6; i++) {
         if (s.players[i]) {
-          out.players[i].name = String(
-            s.players[i].name ?? out.players[i].name
-          );
-          out.players[i].user = String(
-            s.players[i].user ?? out.players[i].user
-          );
+          out.players[i].name = String(s.players[i].name ?? out.players[i].name);
+          out.players[i].user = String(s.players[i].user ?? out.players[i].user);
         }
       }
     }
@@ -124,6 +122,14 @@ function apiPostDebounced(state) {
       console.warn("POST error:", e);
     }
   }, 120);
+}
+
+// Are we currently editing a field? If yes, DO NOT touch DOM.
+function isEditing() {
+  const el = document.activeElement;
+  if (!el) return false;
+  const tag = (el.tagName || "").toUpperCase();
+  return tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable === true;
 }
 
 // -------------------- Overlay Rendering --------------------
@@ -183,8 +189,6 @@ function renderOverlay(state) {
     const line = document.createElement("div");
     line.className = "tagline";
     line.textContent = text;
-
-    // Force Edo on dynamic nodes (prevents fallback during rerender)
     line.style.fontFamily = "Edo, edo, 'Edo', sans-serif";
 
     slot.appendChild(line);
@@ -195,7 +199,7 @@ function renderOverlay(state) {
   });
 }
 
-// -------------------- Control Panel (Non-buggy) --------------------
+// -------------------- Control Panel (Stable) --------------------
 let controlState = structuredClone(defaults);
 let lastModeBuilt = null;
 
@@ -217,18 +221,18 @@ function buildControlUIForMode(mode) {
 
     const nameLab = document.createElement("label");
     nameLab.innerHTML = `Player Name
-      <input id="p${i}-name" type="text" autocomplete="off">`;
+      <input id="p${i}-name" type="text" autocomplete="off" spellcheck="false">`;
     card.appendChild(nameLab);
 
     const userLab = document.createElement("label");
     userLab.innerHTML = `Username
-      <input id="p${i}-user" type="text" autocomplete="off">`;
+      <input id="p${i}-user" type="text" autocomplete="off" spellcheck="false">`;
     card.appendChild(userLab);
 
     playersWrap.appendChild(card);
   }
 
-  // Mode selector handler (write to KV)
+  // Mode selector (write to KV)
   modeSel.onchange = () => {
     const next = normalizeState(controlState);
     next.mode = clamp(Number(modeSel.value), 1, 6);
@@ -236,7 +240,7 @@ function buildControlUIForMode(mode) {
     apiPostDebounced(next);
   };
 
-  // Input handlers (write to KV)
+  // Inputs (write to KV)
   for (let i = 0; i < mode; i++) {
     const nameInp = document.getElementById(`p${i}-name`);
     const userInp = document.getElementById(`p${i}-user`);
@@ -281,14 +285,16 @@ function buildControlUIForMode(mode) {
       applyStateToControlInputs(next);
     };
   }
+
+  // Immediately fill values after building
+  applyStateToControlInputs(controlState);
 }
 
 function applyStateToControlInputs(state) {
   const mode = clamp(state.mode, 1, 6);
 
-  // Update the mode dropdown (unless user is actively changing it)
   const modeSel = document.getElementById("mode");
-  if (modeSel && document.activeElement !== modeSel) {
+  if (modeSel && !isEditing()) {
     modeSel.value = String(mode);
   }
 
@@ -297,16 +303,14 @@ function applyStateToControlInputs(state) {
     const userInp = document.getElementById(`p${i}-user`);
     if (!nameInp || !userInp) continue;
 
-    // Don't overwrite what the user is actively typing
-    if (document.activeElement !== nameInp) {
-      const v = state.players[i]?.name ?? "";
-      if (nameInp.value !== v) nameInp.value = v;
-    }
+    // Do not ever overwrite while editing ANY field
+    if (isEditing()) return;
 
-    if (document.activeElement !== userInp) {
-      const v = state.players[i]?.user ?? "";
-      if (userInp.value !== v) userInp.value = v;
-    }
+    const nameV = state.players[i]?.name ?? "";
+    const userV = state.players[i]?.user ?? "";
+
+    if (nameInp.value !== nameV) nameInp.value = nameV;
+    if (userInp.value !== userV) userInp.value = userV;
   }
 }
 
@@ -332,23 +336,30 @@ async function overlayLoop() {
 
 async function controlSyncLoop() {
   try {
+    // If user is typing, do NOT fetch + do NOT touch UI.
+    // This prevents focus/cursor being stolen in some embedded Chromium environments.
+    if (isEditing()) {
+      setTimeout(controlSyncLoop, 600);
+      return;
+    }
+
     const remote = await apiGet();
     controlState = remote;
 
     const mode = clamp(remote.mode, 1, 6);
 
-    // Only rebuild the UI when the mode changes
+    // Only rebuild UI when mode changes (and not editing)
     if (lastModeBuilt !== mode) {
       lastModeBuilt = mode;
       buildControlUIForMode(mode);
+    } else {
+      // Otherwise safely apply values (not editing)
+      applyStateToControlInputs(remote);
     }
-
-    // Otherwise only apply values safely
-    applyStateToControlInputs(remote);
   } catch (e) {
     console.warn("Control sync GET error:", e);
   } finally {
-    setTimeout(controlSyncLoop, 500);
+    setTimeout(controlSyncLoop, 900); // slower = less jitter, still keeps multi-operator sync
   }
 }
 
@@ -369,6 +380,7 @@ const isOverlay = document.body.classList.contains("overlay");
   if (isControl) {
     controlState = initial;
     lastModeBuilt = null; // force first build
+    buildControlUIForMode(clamp(initial.mode, 1, 6));
     controlSyncLoop();
   }
 })();
