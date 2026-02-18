@@ -1,6 +1,6 @@
 // app.js — Cloudflare Worker + KV live sync (OBS/vMix safe)
-// Control panel writes via HTTPS POST, Overlay polls via HTTPS GET.
-// Fixes cursor being kicked out by NEVER syncing/rebuilding while the user is typing.
+// CONTROL: no polling, no timed re-renders (prevents cursor being kicked).
+// OVERLAY: polls KV every 250ms and updates in OBS/vMix.
 
 const API = "https://stasisebs.2024mmorgan.workers.dev/state?key=playerOverlay";
 const OVERLAY_KEY = ""; // OPTIONAL: if you set OVERLAY_KEY in Cloudflare Worker, set it here too.
@@ -58,7 +58,6 @@ function normalizeState(s) {
   const out = structuredClone(defaults);
 
   if (s && typeof s === "object") {
-    // allow mode to be string or number
     const m = Number(s.mode);
     if (Number.isFinite(m)) out.mode = clamp(m, 1, 6);
 
@@ -88,7 +87,6 @@ async function apiGet() {
     headers: headersWithKey(),
     cache: "no-store",
   });
-
   if (!r.ok) throw new Error(`GET failed: ${r.status}`);
 
   const txt = await r.text();
@@ -124,14 +122,6 @@ function apiPostDebounced(state) {
   }, 120);
 }
 
-// Are we currently editing a field? If yes, DO NOT touch DOM.
-function isEditing() {
-  const el = document.activeElement;
-  if (!el) return false;
-  const tag = (el.tagName || "").toUpperCase();
-  return tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable === true;
-}
-
 // -------------------- Overlay Rendering --------------------
 async function waitForFonts() {
   try {
@@ -143,7 +133,6 @@ async function waitForFonts() {
 
 function fitTextToWidth(el, maxPx) {
   let size = parseFloat(getComputedStyle(el).fontSize) || 34;
-
   const MIN = 16;
   const MAX = 36;
 
@@ -199,11 +188,10 @@ function renderOverlay(state) {
   });
 }
 
-// -------------------- Control Panel (Stable) --------------------
+// -------------------- Control Rendering (NO timers) --------------------
 let controlState = structuredClone(defaults);
-let lastModeBuilt = null;
 
-function buildControlUIForMode(mode) {
+function buildControlUI(mode) {
   const modeSel = document.getElementById("mode");
   const playersWrap = document.getElementById("players");
   if (!modeSel || !playersWrap) return;
@@ -232,15 +220,24 @@ function buildControlUIForMode(mode) {
     playersWrap.appendChild(card);
   }
 
-  // Mode selector (write to KV)
+  // Fill values
+  for (let i = 0; i < mode; i++) {
+    const nameInp = document.getElementById(`p${i}-name`);
+    const userInp = document.getElementById(`p${i}-user`);
+    nameInp.value = controlState.players[i]?.name ?? "";
+    userInp.value = controlState.players[i]?.user ?? "";
+  }
+
+  // Mode change: rebuild + POST
   modeSel.onchange = () => {
     const next = normalizeState(controlState);
     next.mode = clamp(Number(modeSel.value), 1, 6);
     controlState = next;
+    buildControlUI(next.mode);     // rebuild ONLY on your explicit mode change
     apiPostDebounced(next);
   };
 
-  // Inputs (write to KV)
+  // Inputs: update state + POST (no rebuild)
   for (let i = 0; i < mode; i++) {
     const nameInp = document.getElementById(`p${i}-name`);
     const userInp = document.getElementById(`p${i}-user`);
@@ -272,8 +269,17 @@ function buildControlUIForMode(mode) {
         user: ["ITZDIRT", "ACE", "J0RD", "R1LEY", "C4SEY", "SKYNET"][idx] || `USER${idx + 1}`,
       }));
       controlState = next;
+
+      // Update inputs instantly (no rebuild needed)
+      const modeNow = clamp(next.mode, 1, 6);
+      for (let i = 0; i < modeNow; i++) {
+        const nameInp = document.getElementById(`p${i}-name`);
+        const userInp = document.getElementById(`p${i}-user`);
+        if (nameInp) nameInp.value = next.players[i].name;
+        if (userInp) userInp.value = next.players[i].user;
+      }
+
       apiPostDebounced(next);
-      applyStateToControlInputs(next);
     };
   }
 
@@ -281,40 +287,13 @@ function buildControlUIForMode(mode) {
     resetBtn.onclick = () => {
       const next = structuredClone(defaults);
       controlState = next;
+      buildControlUI(next.mode);
       apiPostDebounced(next);
-      applyStateToControlInputs(next);
     };
   }
-
-  // Immediately fill values after building
-  applyStateToControlInputs(controlState);
 }
 
-function applyStateToControlInputs(state) {
-  const mode = clamp(state.mode, 1, 6);
-
-  const modeSel = document.getElementById("mode");
-  if (modeSel && !isEditing()) {
-    modeSel.value = String(mode);
-  }
-
-  for (let i = 0; i < mode; i++) {
-    const nameInp = document.getElementById(`p${i}-name`);
-    const userInp = document.getElementById(`p${i}-user`);
-    if (!nameInp || !userInp) continue;
-
-    // Do not ever overwrite while editing ANY field
-    if (isEditing()) return;
-
-    const nameV = state.players[i]?.name ?? "";
-    const userV = state.players[i]?.user ?? "";
-
-    if (nameInp.value !== nameV) nameInp.value = nameV;
-    if (userInp.value !== userV) userInp.value = userV;
-  }
-}
-
-// -------------------- Live Loops --------------------
+// -------------------- Overlay Poll Loop --------------------
 let lastOverlayJson = "";
 
 async function overlayLoop() {
@@ -334,35 +313,6 @@ async function overlayLoop() {
   }
 }
 
-async function controlSyncLoop() {
-  try {
-    // If user is typing, do NOT fetch + do NOT touch UI.
-    // This prevents focus/cursor being stolen in some embedded Chromium environments.
-    if (isEditing()) {
-      setTimeout(controlSyncLoop, 600);
-      return;
-    }
-
-    const remote = await apiGet();
-    controlState = remote;
-
-    const mode = clamp(remote.mode, 1, 6);
-
-    // Only rebuild UI when mode changes (and not editing)
-    if (lastModeBuilt !== mode) {
-      lastModeBuilt = mode;
-      buildControlUIForMode(mode);
-    } else {
-      // Otherwise safely apply values (not editing)
-      applyStateToControlInputs(remote);
-    }
-  } catch (e) {
-    console.warn("Control sync GET error:", e);
-  } finally {
-    setTimeout(controlSyncLoop, 900); // slower = less jitter, still keeps multi-operator sync
-  }
-}
-
 // -------------------- Boot --------------------
 const isControl = document.body.classList.contains("control");
 const isOverlay = document.body.classList.contains("overlay");
@@ -379,8 +329,9 @@ const isOverlay = document.body.classList.contains("overlay");
 
   if (isControl) {
     controlState = initial;
-    lastModeBuilt = null; // force first build
-    buildControlUIForMode(clamp(initial.mode, 1, 6));
-    controlSyncLoop();
+    buildControlUI(clamp(initial.mode, 1, 6));
+
+    // IMPORTANT: no control polling. No timers. No focus stealing.
+    // If you later want multi-operator sync, we can add a "SYNC" button instead of auto-sync.
   }
 })();
