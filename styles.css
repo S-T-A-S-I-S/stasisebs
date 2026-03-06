@@ -6,9 +6,9 @@
 
 :root{
   --gold:#FDB827;
-  --text:#000;
+  --text:#250;
   --shadow: 0 2px 0 rgba(0,0,0,.18);
-  --ui-bg:#ff0008;
+  --ui-bg:#0b0b0f;
   --panel:rgba(255,255,255,.06);
   --border:rgba(253,184,39,.25);
 }
@@ -105,5 +105,6 @@ button{
 }
 button:hover{background: rgba(253,184,39,.24);}
 .hint{opacity:.75;margin-top:14px;line-height:1.4}
+
 
 
